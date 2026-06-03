@@ -1,21 +1,23 @@
 # MCDF Manager
 
-MCDF Manager is a desktop app for keeping, reviewing, and sharing MCDF character packages. It is built for people who want a clean local library, an easy way to browse shared entries, and a safer publishing flow when they choose to contribute to the community registry.
+MCDF Manager is a desktop app for keeping, reviewing, and sharing MCDF character packages. It gives players a local character library, a registry browser, and a controlled publishing flow for community sharing.
 
 ## Features
 
 - Keep a local library of MCDF files.
 - Add MCDFs from disk, Google Drive links, or direct HTTPS links.
-- Review basic package details before adding an entry to your library.
+- Review package details before adding an entry to your library.
 - Add a display name, description, tags, 18+ marker, and preview image for your own library entries.
 - Browse The Eorzea Exchange through the public registry index.
 - Download public entries without registering.
-- Register a profile when you want to publish, request access, report content, or use community services.
+- Register a profile for publishing, access requests, reports, profile sync, and community services.
 - Publish entries when connected with an authorized profile.
 
 ## Local-first design
 
-Browsing, downloading, and local library management do not require an account. MCDF Manager stores your library state locally first. Registration is only needed for shared or community features such as publishing, access requests, reports, profile sync, and administration.
+Browsing, downloading, and local library management do not require an account. MCDF Manager stores library state locally first. Registration is required for shared and community features such as publishing, access requests, reports, profile sync, and administration.
+
+Updates replace application files only. User settings, profiles, auth packages, subscriptions, cache, and local library data stay in the app data folder.
 
 ## Building from source
 
@@ -24,7 +26,7 @@ Requirements:
 - Node.js 22+
 - pnpm 9+
 - Rust stable
-- The Tauri prerequisites for your operating system
+- Tauri prerequisites for your operating system
 
 Install dependencies:
 
@@ -46,8 +48,8 @@ pnpm tauri build
 
 ## Release builds
 
-Client releases are built by GitHub Actions from this repository. Release artifacts are published as GitHub Release assets for Windows, macOS, and Linux.
+GitHub Actions builds client releases from this repository. Release artifacts are published as GitHub Release assets for Windows, macOS, and Linux.
 
 ## Privacy and safety
 
-MCDF Manager should not expose raw storage locations for uploaded preview images, file parts, private administrative state, or internal blob locations in user-facing views. Public browsing should use the public registry index only.
+MCDF Manager does not expose raw storage locations for uploaded preview images, file parts, private administrative state, or internal blob locations in user-facing views. Public browsing uses the public registry index.

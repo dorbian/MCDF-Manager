@@ -802,11 +802,16 @@ function removePackageSubscriptionSnapshot(packageHash: string) {
     writePackageSubscriptionSnapshots(snapshots);
   }
 }
-function creatorKeyFromPackage(pkg: Pick<PublicIndexPackageSummary, "owner_public_id" | "owner_display_name">): string {
-  return pkg.owner_public_id || pkg.owner_display_name || "unknown";
+type CreatorPackageIdentity = {
+  owner_public_id?: string | null;
+  owner_display_name?: string | null;
+  owner?: { public_id?: string | null; display_name?: string | null } | null;
+};
+function creatorKeyFromPackage(pkg: CreatorPackageIdentity): string {
+  return pkg.owner_public_id || pkg.owner?.public_id || pkg.owner_display_name || pkg.owner?.display_name || "unknown";
 }
-function creatorLabelFromPackage(pkg: Pick<PublicIndexPackageSummary, "owner_public_id" | "owner_display_name">): string {
-  return pkg.owner_display_name || pkg.owner_public_id || "Unknown creator";
+function creatorLabelFromPackage(pkg: CreatorPackageIdentity): string {
+  return pkg.owner_display_name || pkg.owner?.display_name || pkg.owner_public_id || pkg.owner?.public_id || "Unknown creator";
 }
 const LOCAL_LIBRARY_STORAGE_KEY = "mcdf.localLibrary.entries.v1";
 function readLocalMcdfLibrary(): LocalMcdfEntry[] {
@@ -1781,7 +1786,7 @@ function OnlineLibraryPanel({ addOperation, finishOperation }: PanelProps & { sh
         manifest_url: existing?.manifest_url || null,
         download_url: existing?.download_url || null,
         notes: [
-          "Added to the local library. It can be published later without choosing the MCDF again.",
+          "Added to the local library. It is available for local use and publishing from My Library.",
           ...(info.description ? ["MCDF description was imported into the local entry."] : []),
         ],
       };
@@ -1837,7 +1842,7 @@ function OnlineLibraryPanel({ addOperation, finishOperation }: PanelProps & { sh
         notes: [
           ...scanned.notes,
           "Remote source has been added as an annotated library entry. Publishing can index it later without keeping the temporary MCDF locally.",
-          "Missing-in-registry percentage will be calculated after server-side availability checks are wired into this remote flow.",
+          "Registry availability is checked during publishing and server-side processing.",
         ],
       };
       const next = [entry, ...entries.filter((item) => item.id !== entry.id)];
@@ -1985,7 +1990,7 @@ function OnlineLibraryPanel({ addOperation, finishOperation }: PanelProps & { sh
   const publishSelected = async () => {
     if (!selectedEntry) return;
     if (isRemoteEntry(selectedEntry)) {
-      setError("This entry is remote/index-only. Remote publishing will be a separate flow: scan temp, check missing components, then choose index-only, mirror, or archive.");
+      setError("This entry is remote/index-only. Add the source to My Library, then publish from a local MCDF file or a supported remote source.");
       return;
     }
     if (!hasStoredClientAuth()) {
@@ -2066,7 +2071,7 @@ function OnlineLibraryPanel({ addOperation, finishOperation }: PanelProps & { sh
               <div className="remote-add-card">
                 <div className="eyebrow">Local file</div>
                 <h3>Choose an MCDF from this computer</h3>
-                <p className="empty-small">The entry stays in your library and can be published or updated later without re-selecting the file.</p>
+                <p className="empty-small">The entry stays in your library for local use, editing, publishing, and updates.</p>
                 <PrimaryButton disabled={loading} onClick={addMcdfToLibrary}>{loading ? "Working…" : "Choose MCDF…"}</PrimaryButton>
               </div>
               <div className="remote-add-card">
@@ -2214,7 +2219,7 @@ function OnlineLibraryPanel({ addOperation, finishOperation }: PanelProps & { sh
             {!hasStoredClientAuth() && <p className="empty-small">Connect and authorize this client before publishing.</p>}
             {selectedEntry.storage_state === "subscribed" && <div className="alert success"><div className="font-semibold">Subscribed online MCDF</div><p className="empty-small">This Exchange item is tracked in My Library locally, but the MCDF has not been downloaded yet. Downloading public entries does not require connecting to the archive service; server connection is only needed for private requests, reports, admin actions, or cloud-sync later.</p><PrimaryButton disabled={loading} onClick={downloadSubscribedEntry}>{loading ? "Downloading…" : "Download MCDF"}</PrimaryButton></div>}
             {selectedEntry.storage_state === "removed" && <div className="alert error"><div className="font-semibold">Removed from The Eorzea Exchange</div><p className="empty-small">This MCDF was in your local subscriptions, but it is no longer available in the public Exchange index. The local subscription record is kept so you can see that it was removed instead of silently disappearing.</p></div>}
-            {isRemoteEntry(selectedEntry) && selectedEntry.storage_state !== "subscribed" && selectedEntry.storage_state !== "removed" && <p className="empty-small">Remote entries are ready for indexing/mirroring planning. The next pass should let this button publish a remote entry by rescanning it temporarily and choosing index-only, mirror, or archive.</p>}
+            {isRemoteEntry(selectedEntry) && selectedEntry.storage_state !== "subscribed" && selectedEntry.storage_state !== "removed" && <p className="empty-small">Remote entries remain in My Library as source references. Use Add MCDF or Publish with a supported source to publish them.</p>}
             {friendlyPublishNotes(selectedEntry).length > 0 && <div className="publish-result-summary mt-2">{friendlyPublishNotes(selectedEntry).map((note, index) => <p key={index}>{note}</p>)}</div>}
           </Panel>
         </aside>
@@ -2383,7 +2388,7 @@ function SharedArchiveConnectModal({ onClose, onConnected }: SharedArchiveConnec
         <p>Register when you want to make use of community services or want to upload Character files. Browsing the exchange does not require an account.</p>
         {!clientAuthorized && (
           <>
-            <p>Enter the display name you would like to be known by, or import an existing <span className="inline-code">.mcdfauth</span> package from another computer.</p>
+            <p>Enter the display name shown on your profile, or import an existing <span className="inline-code">.mcdfauth</span> package from another computer.</p>
             <div className="form-grid single-column">
               <Field value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Display name" autoFocus />
             </div>
@@ -3437,7 +3442,7 @@ function SystemAdminPanel({ sharedArchiveConnected }: { sharedArchiveConnected: 
 
           <Panel>
             <div className="panel-title-row"><div><div className="eyebrow">Moderation blocklist</div><h2>Block packages or layers</h2></div><span className={(blocklist?.entries.length || 0) > 0 ? "status-pill status-warn" : "status-pill status-neutral"}>{blocklist ? `${blocklist.package_block_count} packages · ${blocklist.file_block_count} layers` : "not loaded"}</span></div>
-            <p>Use package blocks for a whole character upload. Use layer/file blocks for exact BLAKE3 payload hashes that should not be accepted in any future character, for example disputed paid mods or content outside the community policy. Moderation blocks are private administrative state and do not publish to the public index.</p>
+            <p>Use package blocks for a whole character upload. Use layer/file blocks for exact BLAKE3 payload hashes that are blocked from future publishing, including disputed paid mods or content outside the community policy. Moderation blocks remain private administrative state.</p>
             <div className="form-grid admin-block-form">
               <select value={blockTargetType} onChange={(event) => setBlockTargetType(event.target.value as "package" | "file")}><option value="package">Package / character hash</option><option value="file">Layer / file payload hash</option></select>
               <Field value={selectedHash} onChange={(event) => setSelectedHash(event.target.value)} placeholder="BLAKE3 hash" />
@@ -3660,7 +3665,7 @@ function PublishedIndexPanel({ sharedArchiveConnected }: { sharedArchiveConnecte
   const requestAccessForSelectedPackage = async () => {
     if (!selectedPublicPackage) return;
     if (!sharedArchiveConnected) { setIndexError("Connect to the archive server before requesting access."); return; }
-    const note = window.prompt("Optional note to the creator", "I would like access to this locked MCDF.");
+    const note = window.prompt("Optional note to the creator", "Requesting access to this locked MCDF.");
     if (note === null) return;
     setPackageLoading(true);
     setIndexError(null);
@@ -3809,7 +3814,7 @@ function PublishedIndexPanel({ sharedArchiveConnected }: { sharedArchiveConnecte
             <div>
               <div className="eyebrow">Creator</div>
               <h2>{selectedCreator[1]}</h2>
-              <p>{creatorPackages.length} public entries. Subscriptions are local-first; when a registered cloud profile is connected, they can be mirrored server-side later.</p>
+              <p>{creatorPackages.length} public entries. Subscriptions are stored locally and synced for registered profiles when profile sync is enabled.</p>
               {creatorTagShelf.length > 0 && <div className="tag-row compact-tags">{creatorTagShelf.map((tag) => <span key={tag}>#{tag}</span>)}</div>}
             </div>
             <div className="inline-actions">
