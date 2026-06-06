@@ -1,10 +1,11 @@
-name: Build and Release
+name: Build MCDF Manager release
 
 on:
   push:
     branches:
       - main
     tags:
+      - 'client-v*'
       - 'v*'
       - 'client-*'
   workflow_dispatch:
@@ -14,9 +15,11 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PRODUCT_NAME: MCDF Manager
+  PRODUCT_ASSET_PREFIX: MCDF-Manager
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: client-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -26,36 +29,38 @@ jobs:
     outputs:
       tag_name: ${{ steps.meta.outputs.tag_name }}
       release_name: ${{ steps.meta.outputs.release_name }}
+      version: ${{ steps.meta.outputs.version }}
       create_tag: ${{ steps.meta.outputs.create_tag }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Calculate release tag
+      - name: Calculate client release metadata
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
+          VERSION="$(node -p "require('./package.json').version")"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
             CREATE_TAG="false"
             PRERELEASE="false"
           else
-            VERSION="$(node -p "require('./package.json').version")"
-            TAG_NAME="v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+            TAG_NAME="client-v${VERSION}-build.${GITHUB_RUN_NUMBER}"
             CREATE_TAG="true"
             PRERELEASE="true"
           fi
 
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
           echo "release_name=MCDF Manager ${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "create_tag=${CREATE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
 
   build-tauri:
-    name: Build Tauri (${{ matrix.name }})
+    name: Build desktop client (${{ matrix.name }})
     needs: metadata
     permissions:
       contents: read
@@ -63,19 +68,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
+          - name: Linux-x86_64
+            artifact_platform: linux-x86_64
             platform: ubuntu-22.04
             args: ''
             target: ''
-          - name: windows-x86_64
+          - name: Windows-x86_64
+            artifact_platform: windows-x86_64
             platform: windows-latest
             args: ''
             target: ''
-          - name: macos-aarch64
+          - name: macOS-Apple-Silicon
+            artifact_platform: macos-aarch64
             platform: macos-latest
             args: '--target aarch64-apple-darwin'
             target: aarch64-apple-darwin
-          - name: macos-x86_64
+          - name: macOS-Intel
+            artifact_platform: macos-x86_64
             platform: macos-latest
             args: '--target x86_64-apple-darwin'
             target: x86_64-apple-darwin
@@ -114,26 +123,26 @@ jobs:
       - name: Install Node dependencies
         run: pnpm install --no-frozen-lockfile
 
+      - name: Typecheck and build web client
+        run: pnpm run build
+
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build ${{ matrix.args }}
 
-      - name: Upload release bundles
+      - name: Upload raw platform bundle
         uses: actions/upload-artifact@v4
         with:
-          name: mcdf-manager-${{ matrix.name }}
+          name: ${{ matrix.artifact_platform }}
           if-no-files-found: error
           path: |
             src-tauri/target/release/bundle/**
             src-tauri/target/${{ matrix.target }}/release/bundle/**
 
-
-  # This workflow intentionally packages only the MCDF Manager desktop client bundles.
-
   publish-release:
-    name: Publish GitHub release
+    name: Publish client release
     needs:
       - metadata
       - build-tauri
@@ -163,28 +172,107 @@ jobs:
             git push origin "${TAG_NAME}"
           fi
 
-      - name: Download built bundles
+      - name: Download raw platform bundles
         uses: actions/download-artifact@v4
         with:
           path: release-assets
 
-      - name: Package platform artifacts
+      - name: Package official release assets
         shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
         run: |
           set -euo pipefail
           mkdir -p packaged-assets
-
           shopt -s nullglob
+
           for artifact_dir in release-assets/*; do
-            if [[ -d "${artifact_dir}" ]]; then
-              artifact_name="$(basename "${artifact_dir}")"
-              echo "Packaging ${artifact_name}"
-              (cd "${artifact_dir}" && zip -r "${GITHUB_WORKSPACE}/packaged-assets/${artifact_name}.zip" .)
-            fi
+            [[ -d "${artifact_dir}" ]] || continue
+            platform="$(basename "${artifact_dir}")"
+            case "${platform}" in
+              windows-x86_64) display_platform="Windows-x86_64" ;;
+              linux-x86_64) display_platform="Linux-x86_64" ;;
+              macos-aarch64) display_platform="macOS-Apple-Silicon" ;;
+              macos-x86_64) display_platform="macOS-Intel" ;;
+              *) display_platform="${platform}" ;;
+            esac
+            asset_name="MCDF-Manager-${display_platform}-v${VERSION}.zip"
+            echo "Packaging ${platform} as ${asset_name}"
+            (cd "${artifact_dir}" && zip -qr "${GITHUB_WORKSPACE}/packaged-assets/${asset_name}" .)
           done
 
+          (cd packaged-assets && sha256sum *.zip > checksums.txt)
+
+          node <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+          const path = require('path');
+          const assets = fs.readdirSync('packaged-assets')
+            .filter((name) => name.endsWith('.zip'))
+            .sort()
+            .map((name) => {
+              const file = path.join('packaged-assets', name);
+              return {
+                name,
+                size_bytes: fs.statSync(file).size,
+                sha256: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+              };
+            });
+          const manifest = {
+            product: 'MCDF Manager',
+            version: process.env.VERSION,
+            tag: process.env.TAG_NAME,
+            commit: process.env.GITHUB_SHA,
+            built_at: new Date().toISOString(),
+            assets
+          };
+          fs.writeFileSync('packaged-assets/release-manifest.json', JSON.stringify(manifest, null, 2) + '\n');
+NODE
+
           echo "Packaged assets:"
-          find packaged-assets -type f -maxdepth 1 -print
+          find packaged-assets -maxdepth 1 -type f -print | sort
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          awk '
+            /^## / { seen++; if (seen == 1) { print; next } if (seen > 1) exit }
+            seen == 1 { print }
+          ' CHANGELOG.md > /tmp/latest-changelog.md
+
+          cat > release-body.md <<EOF
+          # MCDF Manager ${TAG_NAME}
+
+          This release contains the desktop client builds for MCDF Manager.
+
+          ## Highlights and fixes
+
+          EOF
+          sed 's/^/          /' /tmp/latest-changelog.md >> release-body.md
+          cat >> release-body.md <<EOF
+
+          ## Downloads
+
+          Download the asset for your operating system from this release. Each build is named as an official MCDF Manager desktop artifact and includes its target platform and version.
+
+          ## Integrity files
+
+          - \`checksums.txt\` contains SHA-256 hashes for the uploaded platform bundles.
+          - \`release-manifest.json\` contains build metadata, commit, tag, asset names, sizes, and hashes.
+
+          ## Known bugs and follow-up work
+
+          Known issues are tracked in GitHub Issues and summarized in CHANGELOG.md when they affect a release. Use the bug report template when reporting a reproducible problem.
+
+          Build run: ${RUN_URL}
+          EOF
 
       - name: Create or update release
         shell: bash
@@ -202,30 +290,22 @@ jobs:
           fi
 
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            echo "Release ${TAG_NAME} already exists; updating title/flags and uploading new attempt assets."
             gh release edit "${TAG_NAME}" \
               --title "${RELEASE_NAME}" \
+              --notes-file release-body.md \
               "${prerelease_arg[@]}"
           else
             gh release create "${TAG_NAME}" \
               --title "${RELEASE_NAME}" \
-              --generate-notes \
+              --notes-file release-body.md \
               "${prerelease_arg[@]}"
           fi
 
-      - name: Upload release assets
+      - name: Upload official release assets
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-
-          shopt -s nullglob
-          for asset in packaged-assets/*.zip; do
-            base="$(basename "${asset}" .zip)"
-            upload_name="${base}-attempt.${RUN_ATTEMPT}.zip"
-            cp "${asset}" "packaged-assets/${upload_name}"
-            gh release upload "${TAG_NAME}" "packaged-assets/${upload_name}"
-          done
+          gh release upload "${TAG_NAME}" packaged-assets/* --clobber

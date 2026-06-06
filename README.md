@@ -9,6 +9,8 @@ MCDF Manager is a desktop library and registry browser for MCDF character packag
 - Shows detected package labels separately from user tags.
 - Browses The Eorzea Exchange through the public registry index.
 - Downloads public entries without registration.
+- Exports local MCDF files back out of the library.
+- Shares public Exchange entries through a copied share reference.
 - Keeps subscribed entries visible in the library, including entries that are no longer listed.
 - Registers publisher profiles for publishing, reports, access requests, profile sync, and community services.
 - Publishes updates through an authenticated profile.
@@ -22,6 +24,8 @@ Library status uses two separate meanings:
 - **Status** describes local availability, such as `local` or `subscribed`.
 - **Public** describes Exchange visibility, such as `in index`, `not listed`, or `removed`.
 
+Library entries group their main actions together: share a public Exchange reference, export or download the MCDF, publish the entry, or remove it from the local library. Moderation checks are enforced by the registry during publishing. Admin users can refresh a selected entry against the moderation blocklist from the entry detail panel.
+
 ## The Eorzea Exchange
 
 The Eorzea Exchange is the public registry view. It reads public listing metadata, preview information, labels, and download options from the registry index. Browsing and downloading public entries do not require registration.
@@ -30,11 +34,23 @@ The Eorzea Exchange is the public registry view. It reads public listing metadat
 
 Publishing requires a registered profile. The publishing flow keeps a local entry editable first, then publishes the selected metadata and preview when the user chooses to share it.
 
+## Creator and moderator hash protection
+
+MCDF Manager supports moderation blocks for package hashes and individual layer/file BLAKE3 hashes. A moderator can mark hashes as restricted, blocked by policy, or potentially illegal from the Admin moderation blocklist. Local library entries remain available on the user's computer, but entries with blocked matches cannot be uploaded or shared through MCDF Manager.
+
+Library list view shows the sharing classification and the package or file that caused the block. The check uses stored BLAKE3 hashes and does not upload MCDF bytes.
+
+Mod creators and rights holders can provide BLAKE3 hashes for review. Approved hashes are added by moderators to the blocklist, which prevents future publishing or vault upload of matching files.
+
 ## Releases
 
-GitHub Actions builds release bundles for Windows, macOS, and Linux. Release assets are attached to tagged GitHub Releases.
+GitHub Actions builds official MCDF Manager desktop bundles for Windows, macOS, and Linux. Release assets use product names, platform names, and the client version. Each release also includes:
 
-Release tags for this repository use the `client-*` prefix.
+- `checksums.txt` with SHA-256 hashes for the downloadable bundles;
+- `release-manifest.json` with product, version, tag, commit, build time, asset sizes, and hashes;
+- release notes generated from the latest `CHANGELOG.md` entry.
+
+Release tags for this repository use the `client-v*` prefix for public client releases. Main branch builds create prerelease build tags for validation.
 
 ## Building from source
 
@@ -63,10 +79,32 @@ Build a desktop release:
 pnpm tauri build
 ```
 
-## Changelog
+## Changelog and bug reports
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md) for release history, fixed bugs, and known follow-up work.
+
+Use GitHub Issues to report bugs. The bug report template asks for reproduction steps, MCDF Manager version, platform, and logs or screenshots.
 
 ## Privacy
 
 MCDF Manager does not show private admin state, raw blob storage locations, internal file locations, or private repository details in user-facing screens. Public browsing uses the public registry index.
+
+### Library sharing status
+
+The Library list view focuses on upload/share readiness. Entries that can be shared use a quiet `Can share` state. Entries blocked by moderation show a strong `Disallowed` state and the `Blocking file` column names the package or internal file hash that prevents upload. Local/on-device storage is kept out of the main status path so the list does not repeat the same local/not-listed wording across multiple columns.
+
+### Analyze MCDF layout
+
+Analyze MCDF opens the file picker directly from the sidebar and keeps a compact action bar visible on the page. The action bar can analyze another MCDF, check registry hashes, or import the inspected MCDF into the local library without publishing it.
+
+After a file is selected, the page shows package notes, component groups, and the internal file inventory. Registry status is tri-state: before the online check runs, file rows show `not checked`; after the check, they show whether the BLAKE3 payload hash is known in the registry or missing. Long game paths and BLAKE3 hashes wrap or appear in hover text so the inspection view stays readable without horizontal scrolling.
+
+Large MCDF files take longer to open because the client safely reads archive metadata and calculates internal payload hashes. The native analyzer opens the package once for metadata and file inventory, reducing duplicate parsing work.
+
+### Selective registry upload
+
+MCDF Manager keeps a decoded package buffer in memory while it builds the internal file inventory. Each internal file stores its path, size, BLAKE3 hash, and offset inside that decoded package. When publishing, the client sends the hash manifest to the registry first. The registry replies with known, missing, and blocked hashes. The client uploads only the missing allowed file slices requested by the registry. Known files stay referenced by hash and are not uploaded again.
+
+## fix121 compile fix
+
+This source package fixes the RAM-slice selective upload build error in the Tauri command layer. The selective upload model remains the same: MCDF Manager parses the package once, keeps decoded package data available to address internal file slices, and uploads only registry-missing slices during publishing.

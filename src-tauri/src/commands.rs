@@ -34,6 +34,37 @@ pub fn window_close(window: tauri::Window) -> Result<(), String> {
 
 
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportLocalMcdfResult {
+    pub source_path: String,
+    pub output_path: String,
+    pub bytes_written: u64,
+}
+
+#[command]
+pub fn export_local_mcdf_file(source_path: String, output_path: String) -> Result<ExportLocalMcdfResult, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err(format!("Local MCDF source does not exist: {source_path}"));
+    }
+    if !source.is_file() {
+        return Err(format!("Local MCDF source is not a file: {source_path}"));
+    }
+    let output = PathBuf::from(&output_path);
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| format!("Failed to create export folder: {error}"))?;
+        }
+    }
+    let bytes_written = fs::copy(&source, &output).map_err(|error| format!("Failed to export MCDF: {error}"))?;
+    Ok(ExportLocalMcdfResult {
+        source_path,
+        output_path,
+        bytes_written,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSettingsResponse {
     pub schema_version: u32,
@@ -679,6 +710,46 @@ pub struct FileProbeResponse {
     pub missing_files: Vec<FileAvailability>,
 }
 
+fn inventory_from_extracted_files(files: Vec<ExtractedFileInfo>) -> Vec<FileInventoryEntry> {
+    files
+        .into_iter()
+        .map(|file| FileInventoryEntry {
+            index: file.index,
+            game_paths: file.game_paths.clone(),
+            length: file.length,
+            mcdf_hash: file.hash.clone(),
+            payload_offset: file.offset,
+            payload_blake3: file.blake3.clone(),
+            media_type: guess_media_type_from_paths(&file.game_paths),
+            metadata: file_display_metadata(&file.game_paths, file.length as u64),
+        })
+        .collect()
+}
+
+#[command]
+pub fn probe_mcdf_hash_manifest(
+    server_url: String,
+    bearer_token: Option<String>,
+    files: Vec<ExtractedFileInfo>,
+) -> Result<FileProbeResponse, String> {
+    let base = normalize_archive_server_url(&server_url)?;
+    let client = archive_http_client()?;
+    let inventory = inventory_from_extracted_files(files);
+    let mut request = client
+        .post(format!("{base}/v1/files/probe"))
+        .json(&FileProbeRequest { files: inventory });
+    if let Some(token) = bearer_token.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_else(|_| "<unreadable response body>".to_string());
+        return Err(format!("online BLAKE3 availability check failed: HTTP {status}: {body}"));
+    }
+    response.json::<FileProbeResponse>().map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExactRebuildDataForServer {
     pub mcdf_offset: usize,
@@ -1092,6 +1163,7 @@ pub fn download_package_from_exchange_index(
             metadata: empty_mcdf_metadata(),
             decoded_container_blake3: String::new(),
             files: Vec::new(),
+            decoded_bytes: Vec::new(),
             prefix_bytes: prefix,
             header_bytes: header,
             trailer_bytes: trailer,
@@ -1675,16 +1747,7 @@ fn upload_extracted_parts_to_central_server(
     let package_hash = blake3::hash(original_bytes).to_hex().to_string();
     let package_size = original_bytes.len() as u64;
 
-    let inventory = package.files.iter().map(|payload| FileInventoryEntry {
-        index: payload.info.index,
-        game_paths: payload.info.game_paths.clone(),
-        length: payload.info.length,
-        mcdf_hash: payload.info.hash.clone(),
-        payload_offset: payload.info.offset,
-        payload_blake3: payload.info.blake3.clone(),
-        media_type: guess_media_type_from_paths(&payload.info.game_paths),
-        metadata: file_display_metadata(&payload.info.game_paths, payload.info.length as u64),
-    }).collect::<Vec<_>>();
+    let inventory = inventory_from_extracted_files(package.files.clone());
 
     let mut probe_request = add_publisher_identity_headers(
         client
@@ -1707,15 +1770,15 @@ fn upload_extracted_parts_to_central_server(
     let probe = probe_response.json::<FileProbeResponse>().map_err(|error| error.to_string())?;
 
     for missing in &probe.missing_files {
-        let Some(payload) = package.files.iter().find(|payload| payload.info.blake3 == missing.payload_blake3) else {
-            return Err(format!("server requested unknown missing file {}", missing.payload_blake3));
-        };
+        let payload_slice = package
+            .file_payload_slice_by_blake3(&missing.payload_blake3)
+            .map_err(|error| format!("server requested unknown missing file {}: {error}", missing.payload_blake3))?;
         let upload_url = missing.upload_url.clone().unwrap_or_else(|| format!("{base}/v1/files/{}/upload", missing.payload_blake3));
         let mut upload_request = add_publisher_identity_headers(
             client
                 .post(upload_url)
                 .header("content-type", "application/octet-stream")
-                .body(payload.bytes.clone()),
+                .body(payload_slice.to_vec()),
             publisher_id,
             publisher_display_name,
             publisher_public_key,
@@ -1776,7 +1839,7 @@ fn upload_extracted_parts_to_central_server(
     let job = response.json::<JobCreateResponse>().map_err(|error| error.to_string())?;
     let mut result = wait_for_archive_job(&client, &job.status_url, bearer_token)?;
     result.notes.insert(0, format!(
-        "Client extracted {} internal files, skipped {} known files, uploaded {} missing files, then waited for server-side publishing job {}.",
+        "Client mapped {} internal files in memory, skipped {} known files, uploaded only {} missing file slices, then waited for server-side publishing job {}.",
         package.files.len(),
         probe.known_files.len(),
         probe.missing_files.len(),
@@ -2035,22 +2098,35 @@ pub fn scan_remote_mcdf_metadata(url: String) -> Result<RemoteMcdfScanResult, St
     scan_result
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McdfAnalyzeResult {
+    pub metadata: MareCharaFileData,
+    pub files: Vec<ExtractedFileInfo>,
+}
+
+#[command]
+pub fn analyze_mcdf(path: String) -> Result<McdfAnalyzeResult, String> {
+    let file = File::open(&path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let package = MCDFParser::parse_package(&mut reader).map_err(|e| format!("Failed to parse MCDF: {e}"))?;
+    Ok(McdfAnalyzeResult { metadata: package.metadata, files: package.files })
+}
+
 #[command]
 pub fn scan_mcdf(path: String) -> Result<MareCharaFileData, String> {
     let file = File::open(&path).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(file);
-    let (metadata, _binary_payload) =
-        MCDFParser::parse(&mut reader).map_err(|e| format!("Failed to parse MCDF: {e}"))?;
-    Ok(metadata)
+    let package = MCDFParser::parse_package(&mut reader).map_err(|e| format!("Failed to parse MCDF: {e}"))?;
+    Ok(package.metadata)
 }
 
 #[command]
 pub fn inspect_mcdf_files(path: String) -> Result<Vec<ExtractedFileInfo>, String> {
     let file = File::open(&path).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(file);
-    let (metadata, binary_payload) =
-        MCDFParser::parse(&mut reader).map_err(|e| format!("Failed to parse MCDF: {e}"))?;
-    MCDFParser::extract_file_infos(&metadata, &binary_payload).map_err(|e| e.to_string())
+    let package = MCDFParser::parse_package(&mut reader).map_err(|e| format!("Failed to parse MCDF: {e}"))?;
+    Ok(package.files)
 }
 
 #[command]

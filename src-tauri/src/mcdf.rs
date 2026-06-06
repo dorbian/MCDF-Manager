@@ -80,7 +80,11 @@ pub struct ExtractedFilePayload {
 pub struct ParsedMCDFPackage {
     pub metadata: MareCharaFileData,
     pub decoded_container_blake3: String,
-    pub files: Vec<ExtractedFilePayload>,
+    /// Internal files are represented as offsets into `decoded_bytes`.
+    /// This avoids cloning every payload during analysis and lets upload code
+    /// send only the missing registry slices after the hash probe returns.
+    pub files: Vec<ExtractedFileInfo>,
+    pub decoded_bytes: Vec<u8>,
     pub prefix_bytes: Vec<u8>,
     pub header_bytes: Vec<u8>,
     pub trailer_bytes: Vec<u8>,
@@ -93,6 +97,29 @@ pub struct ParsedMCDFPackage {
 }
 
 impl ParsedMCDFPackage {
+    pub fn file_payload_slice(&self, info: &ExtractedFileInfo) -> Result<&[u8], MCDFError> {
+        let start = self.payload_start
+            .checked_add(info.offset as usize)
+            .ok_or_else(|| MCDFError::InvalidPayload("file slice start overflow".to_string()))?;
+        let end = start
+            .checked_add(info.length as usize)
+            .ok_or_else(|| MCDFError::InvalidPayload("file slice end overflow".to_string()))?;
+        if end > self.payload_end || end > self.decoded_bytes.len() {
+            return Err(MCDFError::InvalidPayload(format!(
+                "file #{} slice exceeds decoded payload: end {end}, payload_end {}, decoded {}",
+                info.index, self.payload_end, self.decoded_bytes.len()
+            )));
+        }
+        Ok(&self.decoded_bytes[start..end])
+    }
+
+    pub fn file_payload_slice_by_blake3(&self, hash: &str) -> Result<&[u8], MCDFError> {
+        let Some(info) = self.files.iter().find(|file| file.blake3 == hash) else {
+            return Err(MCDFError::InvalidPayload(format!("unknown internal file hash {hash}")));
+        };
+        self.file_payload_slice(info)
+    }
+
     pub fn rebuild_inner<W: Write>(&self, writer: &mut W, files_data: &[&[u8]]) -> Result<(), MCDFError> {
         writer.write_all(&self.prefix_bytes)?;
         writer.write_all(&self.header_bytes)?;
@@ -157,7 +184,10 @@ impl MCDFParser {
         let binary_payload = package
             .files
             .iter()
-            .flat_map(|file| file.bytes.clone())
+            .map(|info| package.file_payload_slice(info))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(|bytes| bytes.to_vec())
             .collect::<Vec<_>>();
         Ok((package.metadata, binary_payload))
     }
@@ -175,7 +205,7 @@ impl MCDFParser {
             let mut decompressed = Vec::new();
             gz.read_to_end(&mut decompressed)
                 .map_err(|e| MCDFError::Gzip(e.to_string()))?;
-            let mut parsed = Self::parse_inner_mcdf_from_slice(&decompressed)?;
+            let mut parsed = Self::parse_inner_mcdf_from_owned(decompressed)?;
             parsed.container_encoding = CONTAINER_GZIP.to_string();
             return Ok(parsed);
         }
@@ -183,14 +213,14 @@ impl MCDFParser {
         if !all_data.starts_with(b"MCDF") {
             if let Ok(decompressed) = k4os_legacy_decompress(&all_data) {
                 if find_mcdf_marker(&decompressed).is_some() {
-                    let mut parsed = Self::parse_inner_mcdf_from_slice(&decompressed)?;
+                    let mut parsed = Self::parse_inner_mcdf_from_owned(decompressed)?;
                     parsed.container_encoding = CONTAINER_K4OS_LZ4_LEGACY.to_string();
                     return Ok(parsed);
                 }
             }
         }
 
-        let mut parsed = Self::parse_inner_mcdf_from_slice(&all_data)?;
+        let mut parsed = Self::parse_inner_mcdf_from_owned(all_data)?;
         parsed.container_encoding = CONTAINER_RAW.to_string();
         Ok(parsed)
     }
@@ -200,7 +230,10 @@ impl MCDFParser {
         let binary_payload = package
             .files
             .iter()
-            .flat_map(|file| file.bytes.clone())
+            .map(|info| package.file_payload_slice(info))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(|bytes| bytes.to_vec())
             .collect::<Vec<_>>();
         Ok((package.metadata, binary_payload))
     }
@@ -211,7 +244,7 @@ impl MCDFParser {
             let mut decompressed = Vec::new();
             gz.read_to_end(&mut decompressed)
                 .map_err(|e| MCDFError::Gzip(e.to_string()))?;
-            let mut parsed = Self::parse_inner_mcdf_from_slice(&decompressed)?;
+            let mut parsed = Self::parse_inner_mcdf_from_owned(decompressed)?;
             parsed.container_encoding = CONTAINER_GZIP.to_string();
             return Ok(parsed);
         }
@@ -219,24 +252,28 @@ impl MCDFParser {
         if !data.starts_with(b"MCDF") {
             if let Ok(decompressed) = k4os_legacy_decompress(data) {
                 if find_mcdf_marker(&decompressed).is_some() {
-                    let mut parsed = Self::parse_inner_mcdf_from_slice(&decompressed)?;
+                    let mut parsed = Self::parse_inner_mcdf_from_owned(decompressed)?;
                     parsed.container_encoding = CONTAINER_K4OS_LZ4_LEGACY.to_string();
                     return Ok(parsed);
                 }
             }
         }
 
-        let mut parsed = Self::parse_inner_mcdf_from_slice(data)?;
+        let mut parsed = Self::parse_inner_mcdf_from_owned(data.to_vec())?;
         parsed.container_encoding = CONTAINER_RAW.to_string();
         Ok(parsed)
     }
 
     fn parse_inner_mcdf_from_slice(data: &[u8]) -> Result<ParsedMCDFPackage, MCDFError> {
+        Self::parse_inner_mcdf_from_owned(data.to_vec())
+    }
+
+    fn parse_inner_mcdf_from_owned(data: Vec<u8>) -> Result<ParsedMCDFPackage, MCDFError> {
         if data.len() < 9 {
             return Err(MCDFError::TooSmall { actual: data.len(), needed: 9 });
         }
 
-        let mcdf_offset = find_mcdf_marker(data).ok_or_else(|| {
+        let mcdf_offset = find_mcdf_marker(&data).ok_or_else(|| {
             let preview_len = data.len().min(4);
             let mut preview = [0u8; 4];
             preview[..preview_len].copy_from_slice(&data[..preview_len]);
@@ -278,7 +315,7 @@ impl MCDFParser {
         }
 
         let json_data = &data[json_start..declared_json_end];
-        let (metadata, actual_json_len) = parse_metadata_with_fallbacks(json_data, data, json_start, declared_json_len)?;
+        let (metadata, actual_json_len) = parse_metadata_with_fallbacks(json_data, &data, json_start, declared_json_len)?;
         let expected_payload_len: usize = metadata.files.iter().map(|f| f.length as usize).sum();
         let payload_start = json_start
             .checked_add(actual_json_len)
@@ -295,15 +332,20 @@ impl MCDFParser {
         }
 
         let binary_payload = &data[payload_start..payload_end];
-        let files = Self::extract_file_payloads(&metadata, binary_payload)?;
+        let files = Self::extract_file_infos(&metadata, binary_payload)?;
+        let decoded_container_blake3 = blake3::hash(&data).to_hex().to_string();
+        let prefix_bytes = data[..mcdf_offset].to_vec();
+        let header_bytes = data[mcdf_offset..payload_start].to_vec();
+        let trailer_bytes = data[payload_end..].to_vec();
 
         Ok(ParsedMCDFPackage {
             metadata,
-            decoded_container_blake3: blake3::hash(data).to_hex().to_string(),
+            decoded_container_blake3,
             files,
-            prefix_bytes: data[..mcdf_offset].to_vec(),
-            header_bytes: data[mcdf_offset..payload_start].to_vec(),
-            trailer_bytes: data[payload_end..].to_vec(),
+            decoded_bytes: data,
+            prefix_bytes,
+            header_bytes,
+            trailer_bytes,
             mcdf_offset,
             version,
             json_len: actual_json_len,

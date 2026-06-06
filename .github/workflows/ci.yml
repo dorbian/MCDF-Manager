@@ -1,0 +1,52 @@
+name: Client CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  validate-client:
+    name: Validate MCDF Manager client
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Validate public product text
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE 'supposed to|intended to|private admin repo|psychic-system' README.md CHANGELOG.md src --exclude-dir=node_modules; then
+            echo "Public/product text contains wording or private repo details that do not belong in the public client." >&2
+            exit 1
+          fi
+
+      - name: Validate changelog has release entries
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q '^## ' CHANGELOG.md
