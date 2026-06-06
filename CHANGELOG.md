@@ -1,6 +1,24 @@
 # Changelog
 
 
+## 0.1.0 — Client release pipeline
+
+### Added
+- Added release helper scripts for public text validation, release version validation, release notes generation, and release manifest generation.
+- Added a separate client build workflow for temporary main-branch/manual Actions artifacts without creating public GitHub Releases.
+- Added Rust `cargo check` to CI and release builds so Tauri command-layer compile errors are caught before release assets are published.
+
+### Changed
+- Public client releases are now created from `client-v*` tags or the manual release workflow, not automatically from every main branch push.
+- Release workflow metadata now derives the public version from the release tag and requires it to match `package.json`.
+- Release notes now use a dedicated generator script and publish as `MCDF Manager <version>` instead of exposing raw tag/build wording.
+- README now documents the release pipeline, official artifact names, and the tag-based release process.
+
+### Fixed
+- Main branch validation no longer creates noisy prerelease GitHub entries for ordinary source pushes.
+- CI now catches Rust backend compile failures like missing Tauri command struct fields.
+
+
 ## fix122-policy-admin-ux
 
 ### Changed

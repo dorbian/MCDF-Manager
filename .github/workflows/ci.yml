@@ -20,6 +20,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
@@ -33,20 +46,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build frontend
-        run: pnpm run build
-
       - name: Validate public product text
-        shell: bash
-        run: |
-          set -euo pipefail
-          if grep -RInE 'supposed to|intended to|private admin repo|psychic-system' README.md CHANGELOG.md src --exclude-dir=node_modules; then
-            echo "Public/product text contains wording or private repo details that do not belong in the public client." >&2
-            exit 1
-          fi
+        run: pnpm run validate:public-text
 
       - name: Validate changelog has release entries
         shell: bash
-        run: |
-          set -euo pipefail
-          grep -q '^## ' CHANGELOG.md
+        run: grep -q '^## ' CHANGELOG.md
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Check Rust client backend
+        working-directory: src-tauri
+        run: cargo check

@@ -1,14 +1,25 @@
-name: Build MCDF Manager release
+name: Release MCDF Manager client
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'client-v*'
-      - 'v*'
-      - 'client-*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to release, for example 0.1.23'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the GitHub Release as prerelease'
+        required: true
+        default: false
+        type: boolean
+      draft:
+        description: 'Create the GitHub Release as a draft'
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -19,7 +30,7 @@ env:
   PRODUCT_ASSET_PREFIX: MCDF-Manager
 
 concurrency:
-  group: client-release-${{ github.ref }}
+  group: client-release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -32,9 +43,23 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       create_tag: ${{ steps.meta.outputs.create_tag }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      draft: ${{ steps.meta.outputs.draft }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
 
       - name: Calculate client release metadata
         id: meta
@@ -42,22 +67,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="$(node -p "require('./package.json').version")"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
+            VERSION="${TAG_NAME#client-v}"
             CREATE_TAG="false"
             PRERELEASE="false"
+            DRAFT="false"
           else
-            TAG_NAME="client-v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+            VERSION="${{ inputs.version }}"
+            TAG_NAME="client-v${VERSION}"
             CREATE_TAG="true"
-            PRERELEASE="true"
+            PRERELEASE="${{ inputs.prerelease }}"
+            DRAFT="${{ inputs.draft }}"
           fi
 
+          RELEASE_VERSION="${VERSION}" REQUIRE_PACKAGE_VERSION_MATCH=true REQUIRE_CHANGELOG_VERSION_MATCH=true pnpm run validate:release-version
+
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "release_name=MCDF Manager ${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "release_name=MCDF Manager ${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "create_tag=${CREATE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "draft=${DRAFT}" >> "${GITHUB_OUTPUT}"
 
   build-tauri:
     name: Build desktop client (${{ matrix.name }})
@@ -123,8 +154,15 @@ jobs:
       - name: Install Node dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Typecheck and build web client
+      - name: Validate public product text
+        run: pnpm run validate:public-text
+
+      - name: Build frontend
         run: pnpm run build
+
+      - name: Check Rust client backend
+        working-directory: src-tauri
+        run: cargo check
 
       - name: Build Tauri app
         env:
@@ -155,7 +193,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create release tag for main build
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Create release tag for manual release
         if: needs.metadata.outputs.create_tag == 'true'
         shell: bash
         run: |
@@ -180,7 +231,7 @@ jobs:
       - name: Package official release assets
         shell: bash
         env:
-          VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
         run: |
           set -euo pipefail
@@ -197,82 +248,24 @@ jobs:
               macos-x86_64) display_platform="macOS-Intel" ;;
               *) display_platform="${platform}" ;;
             esac
-            asset_name="MCDF-Manager-${display_platform}-v${VERSION}.zip"
+            asset_name="MCDF-Manager-${display_platform}-v${RELEASE_VERSION}.zip"
             echo "Packaging ${platform} as ${asset_name}"
             (cd "${artifact_dir}" && zip -qr "${GITHUB_WORKSPACE}/packaged-assets/${asset_name}" .)
           done
 
+          test -n "$(find packaged-assets -maxdepth 1 -name '*.zip' -print -quit)"
           (cd packaged-assets && sha256sum *.zip > checksums.txt)
-
-          node <<'NODE'
-          const fs = require('fs');
-          const crypto = require('crypto');
-          const path = require('path');
-          const assets = fs.readdirSync('packaged-assets')
-            .filter((name) => name.endsWith('.zip'))
-            .sort()
-            .map((name) => {
-              const file = path.join('packaged-assets', name);
-              return {
-                name,
-                size_bytes: fs.statSync(file).size,
-                sha256: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
-              };
-            });
-          const manifest = {
-            product: 'MCDF Manager',
-            version: process.env.VERSION,
-            tag: process.env.TAG_NAME,
-            commit: process.env.GITHUB_SHA,
-            built_at: new Date().toISOString(),
-            assets
-          };
-          fs.writeFileSync('packaged-assets/release-manifest.json', JSON.stringify(manifest, null, 2) + '\n');
-NODE
+          pnpm run release:manifest -- packaged-assets
 
           echo "Packaged assets:"
           find packaged-assets -maxdepth 1 -type f -print | sort
 
       - name: Generate release notes
-        shell: bash
         env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
-          VERSION: ${{ needs.metadata.outputs.version }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          awk '
-            /^## / { seen++; if (seen == 1) { print; next } if (seen > 1) exit }
-            seen == 1 { print }
-          ' CHANGELOG.md > /tmp/latest-changelog.md
-
-          cat > release-body.md <<EOF
-          # MCDF Manager ${TAG_NAME}
-
-          This release contains the desktop client builds for MCDF Manager.
-
-          ## Highlights and fixes
-
-          EOF
-          sed 's/^/          /' /tmp/latest-changelog.md >> release-body.md
-          cat >> release-body.md <<EOF
-
-          ## Downloads
-
-          Download the asset for your operating system from this release. Each build is named as an official MCDF Manager desktop artifact and includes its target platform and version.
-
-          ## Integrity files
-
-          - \`checksums.txt\` contains SHA-256 hashes for the uploaded platform bundles.
-          - \`release-manifest.json\` contains build metadata, commit, tag, asset names, sizes, and hashes.
-
-          ## Known bugs and follow-up work
-
-          Known issues are tracked in GitHub Issues and summarized in CHANGELOG.md when they affect a release. Use the bug report template when reporting a reproducible problem.
-
-          Build run: ${RUN_URL}
-          EOF
+        run: pnpm run release:notes -- "${RELEASE_VERSION}"
 
       - name: Create or update release
         shell: bash
@@ -281,24 +274,28 @@ NODE
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
           PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          DRAFT: ${{ needs.metadata.outputs.draft }}
         run: |
           set -euo pipefail
 
-          prerelease_arg=()
+          release_args=()
           if [[ "${PRERELEASE}" == "true" ]]; then
-            prerelease_arg=(--prerelease)
+            release_args+=(--prerelease)
+          fi
+          if [[ "${DRAFT}" == "true" ]]; then
+            release_args+=(--draft)
           fi
 
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
             gh release edit "${TAG_NAME}" \
               --title "${RELEASE_NAME}" \
               --notes-file release-body.md \
-              "${prerelease_arg[@]}"
+              "${release_args[@]}"
           else
             gh release create "${TAG_NAME}" \
               --title "${RELEASE_NAME}" \
               --notes-file release-body.md \
-              "${prerelease_arg[@]}"
+              "${release_args[@]}"
           fi
 
       - name: Upload official release assets
